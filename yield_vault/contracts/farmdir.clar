@@ -1,5 +1,5 @@
-;; DeFi Yield Farming Contract - Stage 2
-;; Added yield verification, consensus mechanism, and rewards
+;; DeFi Yield Farming Contract
+;; Handles liquidity provider registration, yield reporting, and reward distribution
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -7,9 +7,6 @@
 (define-constant reward-per-epoch u1000000) ;; 1 STX per valid yield report
 (define-constant max-yield-variance 10) ;; 10% maximum variance for yield verification
 (define-constant min-verifiers u3) ;; Minimum verifiers for consensus
-(define-constant PERFORMANCE-THRESHOLD u80) ;; Minimum performance score
-(define-constant SLASHING-AMOUNT u10000000) ;; 10 STX slashing penalty
-(define-constant MAX-INACTIVE-TIME u86400) ;; Max seconds without reporting (24 hours)
 
 ;; Error codes
 (define-constant ERR-NOT-AUTHORIZED (err u401))
@@ -18,13 +15,12 @@
 (define-constant ERR-POOL-NOT-FOUND (err u404))
 (define-constant ERR-INVALID-YIELD (err u405))
 (define-constant ERR-VERIFICATION-FAILED (err u406))
-(define-constant ERR-LOW-PERFORMANCE (err u407))
-(define-constant ERR-INACTIVE-POOL (err u408))
 
 ;; Pool tracking
 (define-map pool-index uint (string-ascii 24))
 (define-map pool-managers principal (string-ascii 24))
 (define-data-var pool-counter uint u0)
+
 
 ;; Data structures
 (define-map liquidity-pools
@@ -69,16 +65,6 @@
     }
 )
 
-(define-map pool-metrics
-    { pool-id: (string-ascii 24) }
-    {
-        last-report-timestamp: uint,
-        consecutive-verifications: uint,
-        total-rewards: uint,
-        total-penalties: uint
-    }
-)
-
 ;; Pool registration
 (define-public (register-pool (pool-id (string-ascii 24)) 
                             (volatility int)
@@ -98,17 +84,6 @@
                             volatility: volatility,
                             impermanent-loss: impermanent-loss
                         }
-                    })
-                (map-set pool-managers tx-sender pool-id)
-                (map-set pool-index (var-get pool-counter) pool-id)
-                (var-set pool-counter (+ (var-get pool-counter) u1))
-                (map-set pool-metrics
-                    {pool-id: pool-id}
-                    {
-                        last-report-timestamp: u0,
-                        consecutive-verifications: u0,
-                        total-rewards: u0,
-                        total-penalties: u0
                     })
                 (ok true)))))
 
@@ -170,54 +145,6 @@
                 (ok true))
             ERR-NOT-AUTHORIZED)))
 
-;; Submit consensus data (for verifiers)
-(define-public (submit-consensus-data 
-                (protocol-hash (string-ascii 16))
-                (epoch uint)
-                (apr-avg int)
-                (tvl-avg uint)
-                (fees-avg uint)
-                (impermanent-loss-avg uint))
-    (let ((existing-data (map-get? consensus-yields 
-                          {protocol-hash: protocol-hash, epoch: epoch})))
-        (if (is-some existing-data)
-            ;; Update existing consensus data
-            (let ((unwrapped-data (unwrap-panic existing-data)))
-                (map-set consensus-yields
-                    {protocol-hash: protocol-hash, epoch: epoch}
-                    {
-                        apr-avg: (/ (+ (* (get apr-avg unwrapped-data) 
-                                         (get reporter-count unwrapped-data))
-                                     apr-avg)
-                                  (+ (get reporter-count unwrapped-data) u1)),
-                        tvl-avg: (/ (+ (* (get tvl-avg unwrapped-data) 
-                                        (get reporter-count unwrapped-data))
-                                    tvl-avg)
-                                 (+ (get reporter-count unwrapped-data) u1)),
-                        fees-avg: (/ (+ (* (get fees-avg unwrapped-data) 
-                                         (get reporter-count unwrapped-data))
-                                     fees-avg)
-                                  (+ (get reporter-count unwrapped-data) u1)),
-                        impermanent-loss-avg: (/ (+ (* (get impermanent-loss-avg unwrapped-data) 
-                                                    (get reporter-count unwrapped-data))
-                                                impermanent-loss-avg)
-                                             (+ (get reporter-count unwrapped-data) u1)),
-                        reporter-count: (+ (get reporter-count unwrapped-data) u1)
-                    })
-                (ok true))
-            ;; Create new consensus data
-            (begin
-                (map-set consensus-yields
-                    {protocol-hash: protocol-hash, epoch: epoch}
-                    {
-                        apr-avg: apr-avg,
-                        tvl-avg: tvl-avg,
-                        fees-avg: fees-avg,
-                        impermanent-loss-avg: impermanent-loss-avg,
-                        reporter-count: u1
-                    })
-                (ok true)))))
-
 ;; Verify yield and distribute rewards
 (define-public (verify-yield (pool-id (string-ascii 24))
                            (epoch uint)
@@ -228,19 +155,10 @@
           (consensus (map-get? consensus-yields 
                       {protocol-hash: protocol-hash, epoch: epoch}))
           (pool (unwrap! (map-get? liquidity-pools {pool-id: pool-id})
-                        ERR-POOL-NOT-FOUND))
-          (metrics (default-to 
-                   {
-                       last-report-timestamp: u0,
-                       consecutive-verifications: u0,
-                       total-rewards: u0,
-                       total-penalties: u0
-                   }
-                   (map-get? pool-metrics {pool-id: pool-id}))))
+                        ERR-POOL-NOT-FOUND)))
         (if (is-some consensus)
             (let ((consensus-unwrapped (unwrap-panic consensus)))
                 (if (and
-                    (>= (get reporter-count consensus-unwrapped) min-verifiers)
                     (validate-variance 
                         (get apr data)
                         (get apr-avg consensus-unwrapped))
@@ -260,32 +178,8 @@
                         (map-set yield-reports
                             {pool-id: pool-id, epoch: epoch}
                             (merge data {verified: true}))
-                        ;; Update metrics
-                        (map-set pool-metrics
-                            {pool-id: pool-id}
-                            (merge metrics 
-                                {
-                                    consecutive-verifications: (+ (get consecutive-verifications metrics) u1),
-                                    total-rewards: (+ (get total-rewards metrics) reward-per-epoch)
-                                }))
-                        ;; Update performance score
-                        (map-set liquidity-pools
-                            {pool-id: pool-id}
-                            (merge pool 
-                                {performance-score: (min u100 (+ (get performance-score pool) u1))}))
                         (ok true))
-                    (begin
-                        ;; Verification failed, update metrics
-                        (map-set pool-metrics
-                            {pool-id: pool-id}
-                            (merge metrics 
-                                {consecutive-verifications: u0}))
-                        ;; Decrease performance score
-                        (map-set liquidity-pools
-                            {pool-id: pool-id}
-                            (merge pool 
-                                {performance-score: (max u1 (- (get performance-score pool) u5))}))
-                        ERR-VERIFICATION-FAILED)))
+                    ERR-VERIFICATION-FAILED))
             ERR-INVALID-YIELD)))
 
 ;; Private helper functions
@@ -297,6 +191,68 @@
     (if (< value 0)
         (* value -1)
         value))
+
+;; Read-only functions
+(define-read-only (get-pool-info (pool-id (string-ascii 24)))
+    (map-get? liquidity-pools {pool-id: pool-id}))
+
+(define-read-only (get-yield-data (pool-id (string-ascii 24)) 
+                                 (epoch uint))
+    (map-get? yield-reports {pool-id: pool-id, epoch: epoch}))
+
+(define-read-only (get-consensus-yields (protocol-hash (string-ascii 16)) 
+                                       (epoch uint))
+    (map-get? consensus-yields {protocol-hash: protocol-hash, epoch: epoch}))
+
+
+;; Enhanced DeFi Yield Farming Contract
+
+;; Additional Constants
+(define-constant PERFORMANCE-THRESHOLD u80) ;; Minimum performance score
+(define-constant SLASHING-AMOUNT u10000000) ;; 10 STX slashing penalty
+(define-constant MAX-INACTIVE-TIME u86400) ;; Max seconds without reporting (24 hours)
+(define-constant GOVERNANCE-THRESHOLD u75) ;; 75% for proposal passing
+(define-constant PROPOSAL-DURATION u604800) ;; 7 days in seconds
+
+;; Additional Error Codes
+(define-constant ERR-LOW-PERFORMANCE (err u407))
+(define-constant ERR-INACTIVE-POOL (err u408))
+(define-constant ERR-INSUFFICIENT-LIQUIDITY (err u409))
+(define-constant ERR-INVALID-PROPOSAL (err u410))
+
+;; Additional Maps
+(define-map pool-metrics
+    { pool-id: (string-ascii 24) }
+    {
+        last-report-timestamp: uint,
+        consecutive-verifications: uint,
+        total-rewards: uint,
+        total-penalties: uint
+    }
+)
+
+(define-map proposals
+    { proposal-id: uint }
+    {
+        proposer: principal,
+        title: (string-ascii 50),
+        description: (string-ascii 500),
+        parameter: (string-ascii 20),
+        new-value: uint,
+        votes-for: uint,
+        votes-against: uint,
+        status: (string-ascii 10),
+        creation-timestamp: uint,
+        end-timestamp: uint
+    }
+)
+
+(define-map votes-cast
+    { proposal-id: uint, voter: principal }
+    { vote: bool }
+)
+
+(define-data-var proposal-counter uint u0)
 
 ;; Quality Control Functions
 (define-public (report-underperformance (pool-id (string-ascii 24)))
@@ -343,44 +299,94 @@
                 (ok true))
             ERR-INVALID-YIELD)))
 
-;; Read-only functions
-(define-read-only (get-pool-info (pool-id (string-ascii 24)))
-    (map-get? liquidity-pools {pool-id: pool-id}))
-
-(define-read-only (get-yield-data (pool-id (string-ascii 24)) 
-                                 (epoch uint))
-    (map-get? yield-reports {pool-id: pool-id, epoch: epoch}))
-
-(define-read-only (get-consensus-yields (protocol-hash (string-ascii 16)) 
-                                       (epoch uint))
-    (map-get? consensus-yields {protocol-hash: protocol-hash, epoch: epoch}))
-
-(define-read-only (get-pool-metrics (pool-id (string-ascii 24)))
-    (map-get? pool-metrics {pool-id: pool-id}))
-
-(define-read-only (get-pool-by-index (index uint))
-    (map-get? pool-index index))
+;; Pool lookup functions
+(define-read-only (get-pool-by-manager (manager principal))
+    (let ((pool-id (map-get? pool-managers manager)))
+        {pool-id: (default-to "" pool-id)}))
 
 (define-read-only (get-manager-pool (manager principal))
     (map-get? pool-managers manager))
 
-(define-read-only (get-pool-count)
-    (var-get pool-counter))
-
-;; Withdraw liquidity (emergency function)
-(define-public (emergency-withdraw (pool-id (string-ascii 24)))
-    (let ((pool (unwrap! (map-get? liquidity-pools {pool-id: pool-id})
-                        ERR-POOL-NOT-FOUND)))
+;; Vote function update
+(define-public (vote-on-proposal (proposal-id uint) (vote-value bool) (current-timestamp uint))
+    (let ((proposal (unwrap! (map-get? proposals {proposal-id: proposal-id})
+                          ERR-INVALID-PROPOSAL))
+          (pool-id (unwrap! (get-manager-pool tx-sender)
+                           ERR-NOT-AUTHORIZED))
+          (pool (unwrap! (get-pool-info pool-id)
+                        ERR-NOT-AUTHORIZED)))
         (if (and
-            (is-eq tx-sender (get manager pool))
-            (> (get total-liquidity pool) u0))
+            (is-eq (get status proposal) "active")
+            (< current-timestamp (get end-timestamp proposal))
+            (is-none (map-get? votes-cast 
+                            {proposal-id: proposal-id, voter: tx-sender})))
             (begin
-                (try! (as-contract 
-                    (stx-transfer? (get total-liquidity pool) 
-                                 contract-owner 
-                                 (get manager pool))))
-                (map-set liquidity-pools
-                    {pool-id: pool-id}
-                    (merge pool {total-liquidity: u0}))
+                (map-set votes-cast
+                    {proposal-id: proposal-id, voter: tx-sender}
+                    {vote: vote-value})
+                (map-set proposals
+                    {proposal-id: proposal-id}
+                    (merge proposal
+                        {
+                            votes-for: (+ (get votes-for proposal) 
+                                        (if vote-value u1 u0)),
+                            votes-against: (+ (get votes-against proposal)
+                                           (if vote-value u0 u1))
+                        }))
                 (ok true))
-            ERR-NOT-AUTHORIZED)))
+            ERR-INVALID-PROPOSAL)))
+
+;; Create proposal function update
+(define-public (create-proposal 
+    (title (string-ascii 50))
+    (description (string-ascii 500))
+    (parameter (string-ascii 20))
+    (new-value uint)
+    (current-timestamp uint))
+    (let ((proposal-id (+ (var-get proposal-counter) u1))
+          (pool-id (unwrap! (get-manager-pool tx-sender)
+                           ERR-NOT-AUTHORIZED))
+          (pool (unwrap! (get-pool-info pool-id)
+                        ERR-NOT-AUTHORIZED)))
+        (if (>= (get total-liquidity pool) (* min-deposit u2))
+            (begin
+                (map-set proposals
+                    {proposal-id: proposal-id}
+                    {
+                        proposer: tx-sender,
+                        title: title,
+                        description: description,
+                        parameter: parameter,
+                        new-value: new-value,
+                        votes-for: u0,
+                        votes-against: u0,
+                        status: "active",
+                        creation-timestamp: current-timestamp,
+                        end-timestamp: (+ current-timestamp PROPOSAL-DURATION)
+                    })
+                (var-set proposal-counter proposal-id)
+                (ok proposal-id))
+            ERR-INSUFFICIENT-LIQUIDITY)))
+
+;; Execute proposal function
+(define-public (execute-proposal (proposal-id uint) (current-timestamp uint))
+    (let ((proposal (unwrap! (map-get? proposals {proposal-id: proposal-id})
+                          ERR-INVALID-PROPOSAL)))
+        (if (and
+            (is-eq (get status proposal) "active")
+            (>= current-timestamp (get end-timestamp proposal)))
+            (let ((total-votes (+ (get votes-for proposal) (get votes-against proposal))))
+                (if (and
+                    (> total-votes u0)
+                    (>= (* (get votes-for proposal) u100) (* total-votes GOVERNANCE-THRESHOLD)))
+                    (begin
+                        (map-set proposals
+                            {proposal-id: proposal-id}
+                            (merge proposal {status: "passed"}))
+                        (ok true))
+                    (begin
+                        (map-set proposals
+                            {proposal-id: proposal-id}
+                            (merge proposal {status: "rejected"}))
+                        (ok false))))
+            ERR-INVALID-PROPOSAL)))
